@@ -169,7 +169,7 @@ public class NotificationService {
             Page<NotificationView> matched = notificationRepository
                 .findViewByReferenceNumberAndStatusIn(trimmedReference, dashboardStatuses)
                 .<Page<NotificationView>>map(notification ->
-                    new PageImpl<>(List.of(notification), pageable, 1))
+                    new PageImpl<>(List.of(notification.forDashboard()), pageable, 1))
                 .orElseGet(() -> Page.empty(pageable));
             log.debug("Found {} notifications for reference {}", matched.getNumberOfElements(),
                 trimmedReference);
@@ -181,7 +181,7 @@ public class NotificationService {
             dashboardStatuses, pageable);
         log.debug("Found {} notifications on page {} of {}",
             result.getNumberOfElements(), result.getNumber() + 1, result.getTotalPages());
-        return NotificationPageResponse.from(result);
+        return NotificationPageResponse.from(result.map(NotificationView::forDashboard));
     }
 
     @Transactional
@@ -221,7 +221,10 @@ public class NotificationService {
                 "Cannot amend notification with status: " + notificationAggregate.getStatus());
         }
 
-        notificationAggregate.setSubmittedNotificationBaseline(notificationContentMapper.deepClone(notificationAggregate.getNotification()));
+        // The content baseline is NOT captured here. It was frozen at submit from the resolved
+        // copy and is retained across the amendment, so a cancel restores what was actually
+        // submitted. Capturing it now would snapshot references that re-resolve to today's
+        // addresses — a state that was never submitted.
         List<Document> currentFulfilments = notificationAggregate.getFulfilments();
         notificationAggregate.setSubmittedFulfilmentsBaseline(
             currentFulfilments == null ? null : deepCopyFulfilments(currentFulfilments));
@@ -251,7 +254,17 @@ public class NotificationService {
         }
 
         notificationAggregate.setNotification(notificationContentMapper.deepClone(notificationAggregate.getSubmittedNotificationBaseline()));
-        notificationAggregate.setSubmittedNotificationBaseline(null);
+        // The baseline is deliberately NOT cleared: it is the read source for a submitted
+        // notification, so it has to outlive the cancel that returns us to SUBMITTED.
+        // The restored content carries the frozen parties, which hold addressId *and* details.
+        // Normalise the four referenced roles back to the reference alone so storage never grows
+        // a copy beside the link; the frozen details live in the baseline and nowhere else.
+        // placeOfOrigin and the consignment contact are inline by definition and restore verbatim.
+        Notification restored = notificationAggregate.requireNotification();
+        restored.setConsignor(ConsignmentParty.forStorage(restored.getConsignor()));
+        restored.setConsignee(ConsignmentParty.forStorage(restored.getConsignee()));
+        restored.setImporter(ConsignmentParty.forStorage(restored.getImporter()));
+        restored.setDestination(ConsignmentParty.forStorage(restored.getDestination()));
         List<Document> priorFulfilments = notificationAggregate.getSubmittedFulfilmentsBaseline();
         notificationAggregate.setFulfilments(
             priorFulfilments == null ? null : deepCopyFulfilments(priorFulfilments));
@@ -282,10 +295,20 @@ public class NotificationService {
 
         return executeWithOutboxLock(
             OutboxService.buildAggregateId(referenceNumber), correlationId, eventType.name(), () -> {
-                if (targetStatus == NotificationStatus.SUBMITTED
-                    && notification.getStatus() == NotificationStatus.AMEND) {
-                    notification.setSubmittedNotificationBaseline(null);
-                    notification.setSubmittedFulfilmentsBaseline(null);
+                if (targetStatus == NotificationStatus.SUBMITTED) {
+                    // Freeze the content as submitted. forOutbox is the fully-resolved copy, so the
+                    // baseline holds the address details as they stood at submit, while the stored
+                    // role fields keep their addressId alone — the live link an amendment
+                    // re-resolves. Captured here, inside the lock and before the save, so the
+                    // freeze and the status change land in the same write.
+                    notification.setSubmittedNotificationBaseline(
+                        notificationContentMapper.deepClone(forOutbox.getNotification()));
+                    if (notification.getStatus() == NotificationStatus.AMEND) {
+                        // Unlike the content baseline, the fulfilments baseline stays an amend-only
+                        // scratchpad: it is byte-faithful and has no resolve-to-today problem, so
+                        // accepting the amendment discards it rather than freezing it.
+                        notification.setSubmittedFulfilmentsBaseline(null);
+                    }
                 }
                 notification.setStatus(targetStatus);
                 notification.setUpdated(LocalDateTime.now());

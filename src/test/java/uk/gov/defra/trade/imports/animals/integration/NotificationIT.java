@@ -39,6 +39,8 @@ import uk.gov.defra.trade.imports.animals.notification.NotificationPageResponse;
 import uk.gov.defra.trade.imports.animals.notification.NotificationRepository;
 import uk.gov.defra.trade.imports.animals.notification.NotificationStatus;
 import uk.gov.defra.trade.imports.animals.notification.NotificationView;
+import uk.gov.defra.trade.imports.animals.notification.NotificationFulfilmentsView;
+import uk.gov.defra.trade.imports.animals.notification.NotificationService;
 import uk.gov.defra.trade.imports.animals.notification.Origin;
 import uk.gov.defra.trade.imports.animals.notification.ReferenceNumberGenerator;
 import uk.gov.defra.trade.imports.animals.notification.ReferenceNumberPageResponse;
@@ -88,6 +90,9 @@ class NotificationIT extends IntegrationBase {
 
     @Autowired
     private OutboxEventRepository outboxEventRepository;
+
+    @Autowired
+    private NotificationService notificationService;
 
     @BeforeEach
     void setUp() {
@@ -885,26 +890,35 @@ class NotificationIT extends IntegrationBase {
     }
 
     @Test
-    void amend_shouldPersistSubmittedBaselineInMongo() {
-        // Given — submitted notification with identifiable content
+    void submit_shouldPersistFrozenBaselineInMongo_andAmendShouldRetainIt() {
+        // Given — the freeze lands at SUBMIT. It used to be taken when an amendment began, which
+        // snapshotted whatever the references resolved to that day rather than what was submitted.
         String referenceNumber = createAndSubmitNotificationWithFullContent();
-        NotificationAggregate beforeAmend = notificationRepository.findByReferenceNumber(referenceNumber).orElseThrow();
+        NotificationAggregate afterSubmit =
+            notificationRepository.findByReferenceNumber(referenceNumber).orElseThrow();
 
-        // When
+        assertThat(afterSubmit.getStatus()).isEqualTo(NotificationStatus.SUBMITTED);
+        assertThat(afterSubmit.getSubmittedNotificationBaseline()).isNotNull();
+        assertThat(afterSubmit.getSubmittedNotificationBaseline().getOrigin().getInternalReference())
+            .isEqualTo("INTERNAL-DO-NOT-COPY");
+        assertThat(afterSubmit.getSubmittedNotificationBaseline().getOrigin())
+            .isNotSameAs(afterSubmit.getNotification().getOrigin());
+        assertThat(afterSubmit.getSubmittedNotificationBaseline().getCommodity().getName())
+            .isEqualTo(afterSubmit.getNotification().getCommodity().getName());
+
+        // When — an amendment begins
         webClient("NoAuth")
             .post().uri(NOTIFICATION_ENDPOINT + "/{ref}/amend", referenceNumber)
             .exchange()
             .expectStatus().isOk();
 
-        // Then — baseline captured in Mongo, separate from live content
-        NotificationAggregate reloaded = notificationRepository.findByReferenceNumber(referenceNumber).orElseThrow();
+        // Then — the same freeze is still in Mongo, carried across rather than re-taken
+        NotificationAggregate reloaded =
+            notificationRepository.findByReferenceNumber(referenceNumber).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(NotificationStatus.AMEND);
         assertThat(reloaded.getSubmittedNotificationBaseline()).isNotNull();
         assertThat(reloaded.getSubmittedNotificationBaseline().getOrigin().getInternalReference())
             .isEqualTo("INTERNAL-DO-NOT-COPY");
-        assertThat(reloaded.getSubmittedNotificationBaseline().getOrigin()).isNotSameAs(reloaded.getNotification().getOrigin());
-        assertThat(reloaded.getSubmittedNotificationBaseline().getCommodity().getName())
-            .isEqualTo(beforeAmend.getNotification().getCommodity().getName());
     }
 
     @Test
@@ -974,6 +988,51 @@ class NotificationIT extends IntegrationBase {
     }
 
     @Test
+    void submit_shouldFreezeResolvedAddressDetails_thatLaterBookChangesCannotReach() {
+        // AC #3/#4 end to end: what a submitted notification shows is fixed at submit, and editing
+        // or deleting the address afterwards neither changes it nor errors.
+        stubAddressBook(ADDRESS_BOOK_JSON, 200);
+        String referenceNumber = createNotificationWithReferencedConsignor();
+
+        submitAs(referenceNumber, ORG_ID);
+
+        // The freeze holds the resolved details AND the id they came from (AC #1/#2)...
+        NotificationAggregate afterSubmit = notificationRepository
+            .findByReferenceNumber(referenceNumber).orElseThrow();
+        ConsignmentParty frozen = afterSubmit.getSubmittedNotificationBaseline().getConsignor();
+        assertThat(frozen.getName()).isEqualTo("Astra Rosales");
+        assertThat(frozen.getAddress().getPostcode()).isEqualTo("30055");
+        assertThat(frozen.getAddress().getTownOrCity()).isEqualTo("Vernier");
+        assertThat(frozen.getAddressId()).isEqualTo(ADDRESS_ID);
+        // ...while the stored role field keeps the reference alone, the live link an amend re-reads.
+        assertThat(afterSubmit.getNotification().getConsignor())
+            .isEqualTo(ConsignmentParty.reference(ADDRESS_ID));
+
+        // When — the address is renamed, moved, and then deleted outright in the book
+        stubAddressBook(ADDRESS_BOOK_JSON
+            .replace("Astra Rosales", "Renamed Since Submission")
+            .replace("Vernier", "Carlisle")
+            .replace("30055", "CA1 1AA")
+            .replace("\"deleted\": false", "\"deleted\": true"), 200);
+
+        // Then — the fulfilments read still serves the submission-time details, and does not error
+        NotificationFulfilmentsView view =
+            notificationService.findFulfilmentsView(referenceNumber);
+        assertThat(view.getStatus()).isEqualTo(NotificationStatus.SUBMITTED);
+        assertThat(view.getSubmittedNotificationBaseline().getConsignor().getName())
+            .isEqualTo("Astra Rosales");
+        assertThat(view.getSubmittedNotificationBaseline().getConsignor().getAddress()
+            .getTownOrCity()).isEqualTo("Vernier");
+
+        // And — the dashboard row serves the frozen name inline, so nothing resolves it live
+        NotificationView row = notificationService.findAll(1, null, referenceNumber)
+            .content().getFirst();
+        assertThat(row.getConsignor().getName()).isEqualTo("Astra Rosales");
+        assertThat(row.getConsignor().getAddressId()).isNull();
+        assertThat(row.getSubmittedNotificationBaseline()).isNull();
+    }
+
+    @Test
     void submit_shouldReturn400_andEmitNoSubmittedEvent_whenAReferencedPartyCannotBeResolved() {
         // Given — the referenced address has since been deleted. Unlike a read, which would render
         // the role blank, a submit must fail rather than send GBNAG a party with no name.
@@ -994,8 +1053,12 @@ class NotificationIT extends IntegrationBase {
         // The draft's own NotificationCreated event stays; only the submission must not be emitted.
         assertThat(outboxEventRepository.findAll())
             .noneMatch(e -> e.getEventType().equals(OutboxEventType.NOTIFICATION_SUBMITTED.value()));
-        assertThat(notificationRepository.findByReferenceNumber(referenceNumber).orElseThrow()
-            .getStatus()).isEqualTo(NotificationStatus.DRAFT);
+        NotificationAggregate rejected = notificationRepository
+            .findByReferenceNumber(referenceNumber).orElseThrow();
+        assertThat(rejected.getStatus()).isEqualTo(NotificationStatus.DRAFT);
+        // No freeze either: the resolve aborts before the write, so a failed submit cannot leave a
+        // half-frozen notification behind.
+        assertThat(rejected.getSubmittedNotificationBaseline()).isNull();
     }
 
     @Test
@@ -1103,11 +1166,13 @@ class NotificationIT extends IntegrationBase {
             .post().uri(NOTIFICATION_ENDPOINT + "/{ref}/cancel-amend", referenceNumber)
             .exchange().expectStatus().isOk();
 
-        // Then — reload from Mongo: status reverted, baseline cleared, all amendable fields restored
+        // Then — reload from Mongo: status reverted, all amendable fields restored, and the
+        // baseline RETAINED. Back at SUBMITTED it is the read source again, so clearing it would
+        // leave the notification with nothing to read its addresses from.
         NotificationAggregate restoredInMongo = notificationRepository.findByReferenceNumber(referenceNumber)
             .orElseThrow();
         assertThat(restoredInMongo.getStatus()).isEqualTo(NotificationStatus.SUBMITTED);
-        assertThat(restoredInMongo.getSubmittedNotificationBaseline()).isNull();
+        assertThat(restoredInMongo.getSubmittedNotificationBaseline()).isNotNull();
         assertAmendableContentMatches(submittedInMongo.getNotification(), restoredInMongo.getNotification());
     }
 
@@ -1162,7 +1227,7 @@ class NotificationIT extends IntegrationBase {
     }
 
     @Test
-    void submitFromAmend_shouldClearSubmittedBaseline() {
+    void submitFromAmend_shouldReplaceSubmittedBaselineWithTheNewFreeze() {
         // Given — notification amended with edited content
         String referenceNumber = createAndSubmitNotificationWithFullContent();
 
@@ -1183,12 +1248,15 @@ class NotificationIT extends IntegrationBase {
             .expectBody(NotificationAggregate.class)
             .returnResult().getResponseBody();
 
-        // Then — edited content kept, baseline cleared
+        // Then — edited content kept, and the baseline re-frozen onto the amended content rather
+        // than cleared: a re-submitted notification is frozen at its LATEST submission.
         assertThat(resubmitted.getStatus()).isEqualTo(NotificationStatus.SUBMITTED);
         assertThat(resubmitted.getNotification().getOrigin().getInternalReference()).isEqualTo("EDITED-AND-KEPT");
 
         NotificationAggregate reloaded = notificationRepository.findByReferenceNumber(referenceNumber).orElseThrow();
-        assertThat(reloaded.getSubmittedNotificationBaseline()).isNull();
+        assertThat(reloaded.getSubmittedNotificationBaseline()).isNotNull();
+        assertThat(reloaded.getSubmittedNotificationBaseline().getOrigin().getInternalReference())
+            .isEqualTo("EDITED-AND-KEPT");
         assertThat(reloaded.getNotification().getOrigin().getInternalReference()).isEqualTo("EDITED-AND-KEPT");
 
         // And — the resubmit emits NotificationSubmissionAmended (AMEND -> SUBMITTED), not NotificationSubmitted

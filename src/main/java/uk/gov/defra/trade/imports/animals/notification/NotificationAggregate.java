@@ -66,7 +66,25 @@ public class NotificationAggregate {
     /** Opaque obligation-fulfilment payload — persisted byte-faithfully; never interpreted by the backend. */
     private List<Document> fulfilments;
 
-    /** Pre-amend snapshot of {@link #notification}. Non-null iff status is AMEND; restored by cancelAmend, cleared by submit-from-amend. */
+    /**
+     * The notification content as it was submitted, frozen at submit from the address-resolved
+     * copy. A submitted notification is part of the legal record, so it reads its addresses from
+     * here rather than resolving its references live — editing or deleting the address afterwards
+     * cannot change what it shows.
+     *
+     * <p>Set on every submit (from DRAFT or from AMEND, replacing any previous freeze) and
+     * <em>retained</em> thereafter: through an amendment, so a cancel can restore what was really
+     * submitted, and past that cancel, because it is still the read source. Null only for a
+     * notification that has never been submitted.
+     *
+     * <p>The role fields keep their {@code addressId} alongside this snapshot — the snapshot is
+     * additive. That reference is what an amendment re-resolves to pick up address changes since;
+     * dropping it would leave an amendment editing a copy it could no longer refresh.
+     *
+     * <p><b>Deliberately asymmetric with {@link #submittedFulfilmentsBaseline}</b>, which stays an
+     * amend-only scratchpad. That payload is opaque and byte-faithful, so it has none of the
+     * resolve-to-today problem this snapshot exists to solve, and freezing it would earn nothing.
+     */
     @JsonIgnore
     private Notification submittedNotificationBaseline;
 

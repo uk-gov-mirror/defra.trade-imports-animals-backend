@@ -740,7 +740,7 @@ class NotificationControllerTest {
         private NotificationView testView(String ref, NotificationStatus status, Origin origin,
                 Commodity commodity, ConsignmentParty consignor, Transport transport) {
             return new NotificationView.Data(
-                ref, 0L, status, null, origin, commodity, consignor, null, transport);
+                ref, 0L, status, null, origin, commodity, consignor, null, transport, null);
         }
 
         @Test
@@ -904,6 +904,10 @@ class NotificationControllerTest {
                 @Override public java.time.LocalDateTime getSubmittedAt() { return null; }
                 @Override public java.util.List<org.bson.Document> getFulfilments() {
                     return java.util.List.of(new org.bson.Document("obligationId", "abc"));
+                }
+                @Override public NotificationFulfilmentsView.FrozenParties
+                    getSubmittedNotificationBaseline() {
+                    return null;
                 }
             };
             when(notificationService.findFulfilmentsView(REF_1)).thenReturn(view);
