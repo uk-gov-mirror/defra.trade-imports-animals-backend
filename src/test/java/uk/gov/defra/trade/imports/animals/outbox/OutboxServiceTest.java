@@ -64,6 +64,7 @@ class OutboxServiceTest {
         return NotificationAggregate.builder()
             .referenceNumber(referenceNumber)
             .status(status)
+            .organisationId("5900001")
             .notification(notification)
             .build();
     }
@@ -242,6 +243,19 @@ class OutboxServiceTest {
             outboxService.appendEvent(notificationAggregate, OutboxEventType.NOTIFICATION_SUBMISSION_AMENDED, "trace-amd-7", null);
 
             assertThat(savedEvent().getAggregateVersion()).isEqualTo(3L);
+        }
+
+        @Test
+        void appendEvent_shouldStampOwningOrganisation_fromAggregate() {
+            NotificationAggregate notificationAggregate =
+                aggregateFor("GBN-AG-26-ORG001", NotificationStatus.SUBMITTED);
+            stubNoPriorEvents("GBN-AG-26-ORG001");
+            stubSaveEchoesItsArgument();
+
+            outboxService.appendEvent(
+                notificationAggregate, OutboxEventType.NOTIFICATION_SUBMITTED, "trace-org-1", null);
+
+            assertThat(savedEvent().getOrganisationId()).isEqualTo("5900001");
         }
 
         @Test

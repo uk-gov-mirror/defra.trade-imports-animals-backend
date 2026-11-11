@@ -95,6 +95,7 @@ public class OutboxService {
             .aggregateVersion(nextVersion)
             .eventType(eventType.value())
             .timestamp(now)
+            .organisationId(notificationAggregate.getOrganisationId())
             .data(data)
             .metadata(OutboxEventMetadata.builder()
                 .correlationId(correlationId)
